@@ -7,6 +7,7 @@ setup(name='rancher-gitlab-deploy',
     author='cdrx',
     license='MIT',
     packages=['rancher_gitlab_deploy'],
+    package_data={'rancher_gitlab_deploy': ['models/*.json']},
     zip_safe=False,
     install_requires=[
         'click',

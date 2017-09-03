@@ -5,6 +5,7 @@ import requests
 import json
 import logging
 import contextlib
+import models
 try:
     from http.client import HTTPConnection # py3
 except ImportError:
@@ -46,7 +47,9 @@ from time import sleep
               help="If specified, replace the sidekick image (and :tag) with this one during the upgrade", type=(str, str))
 @click.option('--debug/--no-debug', default=False,
               help="Enable HTTP Debugging")
-def main(rancher_url, rancher_key, rancher_secret, environment, stack, service, new_image, batch_size, batch_interval, start_before_stopping, upgrade_timeout, wait_for_upgrade_to_finish, finish_upgrade, sidekicks, new_sidekick_image, debug):
+@click.option('--create', envvar='RANCHER_URL',
+              help='Create a new container in the stack')
+def main(rancher_url, rancher_key, rancher_secret, environment, stack, service, new_image, batch_size, batch_interval, start_before_stopping, upgrade_timeout, wait_for_upgrade_to_finish, finish_upgrade, sidekicks, new_sidekick_image, debug, create):
     """Performs an in service upgrade of the service specified on the command line"""
 
     if debug:
@@ -124,7 +127,7 @@ def main(rancher_url, rancher_key, rancher_secret, environment, stack, service, 
             service = s
             break
     else:
-        bail("Unable to find a service called '%s', does it exist in Rancher?" % service)
+        createService(api, environment_id, 'testFEZF', 'ubuntu')
 
     # 4 -> Is the service elligible for upgrade?
 
@@ -249,6 +252,20 @@ def main(rancher_url, rancher_key, rancher_secret, environment, stack, service, 
             msg("Upgrade finished")
 
     sys.exit(0)
+
+def createService(api, environment_id, name, image):
+    msg('Create a new service')
+    upgrade = models.getCreateServiceModel()
+    upgrade['name'] = name; 
+    try:
+        r = requests.post("%s/projects/%s/service" % (
+            api, environment_id
+        ), json=upgrade)
+        r.raise_for_status()
+
+    except requests.exceptions.HTTPError as e:
+        bail(str(e) + str(r.json()))
+
 
 def msg(msg):
     click.echo(click.style(msg, fg='green'))
