@@ -5,7 +5,11 @@ import requests
 import json
 import logging
 import contextlib
-import models
+import __tools as tools
+import _service
+import _stack
+import _environment
+
 try:
     from http.client import HTTPConnection # py3
 except ImportError:
@@ -20,12 +24,12 @@ from time import sleep
               help="The environment or account API key")
 @click.option('--rancher-secret', envvar='RANCHER_SECRET_KEY', required=True,
               help="The secret for the access API key")
-@click.option('--environment', default=None,
+@click.option('--environment', 'environmentOpt', default=None,
               help="The name of the environment to add the host into " + \
                    "(only needed if you are using an account API key instead of an environment API key)")
-@click.option('--stack', envvar='CI_PROJECT_NAMESPACE', default=None, required=True,
+@click.option('--stack', 'stackOpt', envvar='CI_PROJECT_NAMESPACE', default=None, required=True,
               help="The name of the stack in Rancher (defaults to the name of the group in GitLab)")
-@click.option('--service', envvar='CI_PROJECT_NAME', default=None, required=True,
+@click.option('--service', 'serviceOpt', envvar='CI_PROJECT_NAME', default=None, required=True,
               help="The name of the service in Rancher to upgrade (defaults to the name of the service in GitLab)")
 @click.option('--start-before-stopping/--no-start-before-stopping', default=False,
               help="Should Rancher start new containers before stopping the old ones?")
@@ -47,242 +51,113 @@ from time import sleep
               help="If specified, replace the sidekick image (and :tag) with this one during the upgrade", type=(str, str))
 @click.option('--debug/--no-debug', default=False,
               help="Enable HTTP Debugging")
-@click.option('--create', envvar='RANCHER_URL',
+@click.option('--create/--no-debug', default=False,
               help='Create a new container in the stack')
-def main(rancher_url, rancher_key, rancher_secret, environment, stack, service, new_image, batch_size, batch_interval, start_before_stopping, upgrade_timeout, wait_for_upgrade_to_finish, finish_upgrade, sidekicks, new_sidekick_image, debug, create):
+@click.option('--image', envvar='RANCHER_URL',
+              help='Choose image to launch')
+def main(rancher_url, rancher_key, rancher_secret, environmentOpt, stackOpt, serviceOpt, new_image, batch_size, batch_interval, start_before_stopping, upgrade_timeout, wait_for_upgrade_to_finish, finish_upgrade, sidekicks, new_sidekick_image, debug, create, image):
     """Performs an in service upgrade of the service specified on the command line"""
 
     if debug:
-        debug_requests_on()
+        tools.debug_requests_on()
 
     # split url to protocol and host
     if "://" not in rancher_url:
-        bail("The Rancher URL doesn't look right")
+        tools.bail("The Rancher URL doesn't look right")
 
     proto, host = rancher_url.split("://")
-    api = "%s://%s:%s@%s/v1" % (proto, rancher_key, rancher_secret, host)
+    api = "%s://%s:%s@%s/v2-beta" % (proto, rancher_key, rancher_secret, host)
 
     # 1 -> Find the environment id in Rancher
-
-    try:
-        r = requests.get("%s/projects?limit=1000" % api)
-        r.raise_for_status()
-    except requests.exceptions.HTTPError:
-        bail("Unable to connect to Rancher at %s - is the URL and API key right?" % host)
+    environment_id, environment_name = _environment.fetch(api, host, environmentOpt)
+    environmentTest = {
+        'id': environment_id,
+        'name': environment_name
+    }
+    
+    if not create:
+        service = upgrade(api, host, environmentTest, stackOpt, serviceOpt, upgrade_timeout, batch_size, batch_interval, start_before_stopping)
     else:
-        environments = r.json()['data']
-
-    environment_id = None
-    if environment is None:
-        environment_id = environments[0]['id']
-        environment_name = environments[0]['name']
-    else:
-        for e in environments:
-            if e['id'].lower() == environment.lower() or e['name'].lower() == environment.lower():
-                environment_id = e['id']
-                environment_name = e['name']
-
-    if not environment_id:
-        if environment:
-            bail("The '%s' environment doesn't exist in Rancher, or your API credentials don't have access to it" % environment)
-        else:
-            bail("No environment in Rancher matches your request")
-
-    # 2 -> Find the stack in the environment
-
-    try:
-        r = requests.get("%s/projects/%s/environments?limit=1000" % (
-            api,
-            environment_id
-        ))
-        r.raise_for_status()
-    except requests.exceptions.HTTPError:
-        bail("Unable to fetch a list of stacks in the environment '%s'" % environment_name)
-    else:
-        stacks = r.json()['data']
-
-    for s in stacks:
-        if s['name'].lower() == stack.lower():
-            stack = s
-            break
-    else:
-        bail("Unable to find a stack called '%s'. Does it exist in the '%s' environment?" % (stack, environment_name))
-
-    # 3 -> Find the service in the stack
-
-    try:
-        r = requests.get("%s/projects/%s/environments/%s/services?limit=1000" % (
-            api,
-            environment_id,
-            stack['id']
-        ))
-        r.raise_for_status()
-    except requests.exceptions.HTTPError:
-        bail("Unable to fetch a list of services in the stack. Does your API key have the right permissions?")
-    else:
-        services = r.json()['data']
-
-    for s in services:
-        if s['name'].lower() == service.lower():
-            service = s
-            break
-    else:
-        createService(api, environment_id, 'testFEZF', 'ubuntu')
-
-    # 4 -> Is the service elligible for upgrade?
-
-    if service['state'] == 'upgraded':
-        warn("The current service state is 'upgraded', marking the previous upgrade as finished before starting a new upgrade...")
-
-        try:
-            r = requests.post("%s/projects/%s/services/%s/?action=finishupgrade" % (
-                api, environment_id, service['id']
-            ))
-            r.raise_for_status()
-        except requests.exceptions.HTTPError:
-            bail("Unable to finish the previous upgrade in Rancher")
-
-        attempts = 0
-        while service['state'] != "active":
-            sleep(2)
-            attempts += 2
-            if attempts > upgrade_timeout:
-                bail("A timeout occured while waiting for Rancher to finish the previous upgrade")
-            try:
-                r = requests.get("%s/projects/%s/services/%s" % (
-                    api, environment_id, service['id']
-                ))
-                r.raise_for_status()
-            except requests.exceptions.HTTPError:
-                bail("Unable to request the service status from the Rancher API")
-            else:
-                service = r.json()
-
-    if service['state'] != 'active':
-        bail("Unable to start upgrade: current service state '%s', but it needs to be 'active'" % service['state'])
-
-    msg("Upgrading %s/%s in environment %s..." % (stack['name'], service['name'], environment_name))
-
-    upgrade = {'inServiceStrategy': {
-        'batchSize': batch_size,
-        'intervalMillis': batch_interval * 1000, # rancher expects miliseconds
-        'startFirst': start_before_stopping,
-        'launchConfig': {},
-        'secondaryLaunchConfigs': []
-    }}
-    # copy over the existing config
-    upgrade['inServiceStrategy']['launchConfig'] = service['launchConfig']
-
-    if sidekicks:
-        # copy over existing sidekicks config
-        upgrade['inServiceStrategy']['secondaryLaunchConfigs'] = service['secondaryLaunchConfigs']
-
-    if new_image:
-        # place new image into config
-        upgrade['inServiceStrategy']['launchConfig']['imageUuid'] = 'docker:%s' % new_image
-
-    if new_sidekick_image:
-        new_sidekick_image = dict(new_sidekick_image)
-
-        for idx, secondaryLaunchConfigs in enumerate(service['secondaryLaunchConfigs']):
-            if secondaryLaunchConfigs['name'] in new_sidekick_image:
-                upgrade['inServiceStrategy']['secondaryLaunchConfigs'][idx]['imageUuid'] = 'docker:%s' % new_sidekick_image[secondaryLaunchConfigs['name']]
-
-    # 5 -> Start the upgrade
-
-    try:
-        r = requests.post("%s/projects/%s/services/%s/?action=upgrade" % (
-            api, environment_id, service['id']
-        ), json=upgrade)
-        r.raise_for_status()
-    except requests.exceptions.HTTPError:
-        bail("Unable to request an upgrade on Rancher")
+        service = _service.createService(api, environmentTest, serviceOpt, image)
 
     # 6 -> Wait for the upgrade to finish
 
     if not wait_for_upgrade_to_finish:
-        msg("Upgrade started")
+        tools.msg("Upgrade started")
     else:
-        msg("Upgrade started, waiting for upgrade to complete...")
+        tools.msg("Upgrade started, waiting for upgrade to complete...")
         attempts = 0
-        while service['state'] != "upgraded":
+        while service['state'] != "active":
+            tools.msg(service['state'])
             sleep(2)
             attempts += 2
             if attempts > upgrade_timeout:
-                bail("A timeout occured while waiting for Rancher to complete the upgrade")
+                tools.bail("A timeout occured while waiting for Rancher to complete the upgrade")
             try:
                 r = requests.get("%s/projects/%s/services/%s" % (
                     api, environment_id, service['id']
                 ))
                 r.raise_for_status()
             except requests.exceptions.HTTPError:
-                bail("Unable to fetch the service status from the Rancher API")
+                tools.bail("Unable to fetch the service status from the Rancher API")
             else:
                 service = r.json()
 
         if not finish_upgrade:
-            msg("Service upgraded")
+            tools.msg("Service upgraded")
             sys.exit(0)
         else:
-            msg("Finishing upgrade...")
+            tools.msg("Finishing upgrade...")
             try:
                 r = requests.post("%s/projects/%s/services/%s/?action=finishupgrade" % (
                     api, environment_id, service['id']
                 ))
                 r.raise_for_status()
-            except requests.exceptions.HTTPError:
-                bail("Unable to finish the upgrade in Rancher")
+            except requests.exceptions.HTTPError as e:
+                tools.bail("Unable to finish the upgrade in Rancher" + str(e.response.status_code))
 
             attempts = 0
             while service['state'] != "active":
                 sleep(2)
                 attempts += 2
                 if attempts > upgrade_timeout:
-                    bail("A timeout occured while waiting for Rancher to finish the previous upgrade")
+                    tools.bail("A timeout occured while waiting for Rancher to finish the previous upgrade")
                 try:
                     r = requests.get("%s/projects/%s/services/%s" % (
                         api, environment_id, service['id']
                     ))
                     r.raise_for_status()
                 except requests.exceptions.HTTPError:
-                    bail("Unable to request the service status from the Rancher API")
+                    tools.bail("Unable to request the service status from the Rancher API")
                 else:
                     service = r.json()
 
-            msg("Upgrade finished")
+            tools.msg("Upgrade finished")
 
     sys.exit(0)
 
-def createService(api, environment_id, name, image):
-    msg('Create a new service')
-    upgrade = models.getCreateServiceModel()
-    upgrade['name'] = name; 
-    try:
-        r = requests.post("%s/projects/%s/service" % (
-            api, environment_id
-        ), json=upgrade)
-        r.raise_for_status()
-
-    except requests.exceptions.HTTPError as e:
-        bail(str(e) + str(r.json()))
 
 
-def msg(msg):
-    click.echo(click.style(msg, fg='green'))
+def upgrade(api, host, environment, stackOpt, serviceOpt, upgrade_timeout, batch_size, batch_interval, start_before_stopping):
+     # 3 -> Find the stack in the environment
+    stack = _stack.fetch(api, host, environment, stackOpt)
+    
+    # 3 -> Find the service in the stack
+    service = _service.fetch(api, environment, stack, serviceOpt)
+    print(str(service))
+    # 4 -> Is the service elligible for upgrade?
+    if service['state'] == 'upgraded':
+        tools.warn("The current service state is 'upgraded', marking the previous upgrade as finished before starting a new upgrade...")
+        service = _service.markHasFinished(api, environment, service, upgrade_timeout)
+    
+    tools.msg("Upgrading %s/%s in environment %s..." % (stack['name'], service['name'], environment['name']))
 
-def warn(msg):
-    click.echo(click.style(msg, fg='yellow'))
+    upgrade = {'inServiceStrategy': {
+        'batchSize': batch_size,
+        'intervalMillis': batch_interval * 1000, # rancher expects miliseconds
+        'startFirst': start_before_stopping,
+        'launchConfig': service['launchConfig'],
+        'secondaryLaunchConfigs': []
+    }}
 
-def bail(msg):
-    click.echo(click.style('Error: ' + msg, fg='red'))
-    sys.exit(1)
-
-def debug_requests_on():
-    '''Switches on logging of the requests module.'''
-    HTTPConnection.debuglevel = 1
-
-    logging.basicConfig()
-    logging.getLogger().setLevel(logging.DEBUG)
-    requests_log = logging.getLogger("requests.packages.urllib3")
-    requests_log.setLevel(logging.DEBUG)
-    requests_log.propagate = True
+    service = _service.upgrade(api, environment, service, upgrade)
