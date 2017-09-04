@@ -76,9 +76,11 @@ def main(rancher_url, rancher_key, rancher_secret, environmentOpt, stackOpt, ser
     }
     
     if not create:
-        service = upgrade(api, host, environmentTest, stackOpt, serviceOpt, upgrade_timeout, batch_size, batch_interval, start_before_stopping)
+        service, mode = upgrade(api, host, environmentTest, stackOpt, serviceOpt, upgrade_timeout, batch_size, batch_interval, start_before_stopping)
     else:
-        service = _service.createService(api, environmentTest, serviceOpt, image)
+        service, mode = _service.createService(api, environmentTest, serviceOpt, image)
+        if service is None:
+            service, mode = upgrade(api, host, environmentTest, stackOpt, serviceOpt, upgrade_timeout, batch_size, batch_interval, start_before_stopping)
 
     # 6 -> Wait for the upgrade to finish
 
@@ -87,8 +89,12 @@ def main(rancher_url, rancher_key, rancher_secret, environmentOpt, stackOpt, ser
     else:
         tools.msg("Upgrade started, waiting for upgrade to complete...")
         attempts = 0
-        while service['state'] != "active":
-            tools.msg(service['state'])
+        if mode == "create":
+            checString = "active"
+        else:
+            checString = "upgraded"
+        tools.msg("Upgrade started, waiting for upgrade to complete..." + checString)
+        while service['state'] != checString:
             sleep(2)
             attempts += 2
             if attempts > upgrade_timeout:
@@ -103,10 +109,7 @@ def main(rancher_url, rancher_key, rancher_secret, environmentOpt, stackOpt, ser
             else:
                 service = r.json()
 
-        if not finish_upgrade:
-            tools.msg("Service upgraded")
-            sys.exit(0)
-        else:
+        if mode != 'create':
             tools.msg("Finishing upgrade...")
             try:
                 r = requests.post("%s/projects/%s/services/%s/?action=finishupgrade" % (
@@ -115,24 +118,23 @@ def main(rancher_url, rancher_key, rancher_secret, environmentOpt, stackOpt, ser
                 r.raise_for_status()
             except requests.exceptions.HTTPError as e:
                 tools.bail("Unable to finish the upgrade in Rancher" + str(e.response.status_code))
+        attempts = 0
+        while service['state'] != "active":
+            sleep(2)
+            attempts += 2
+            if attempts > upgrade_timeout:
+                tools.bail("A timeout occured while waiting for Rancher to finish the previous upgrade")
+            try:
+                r = requests.get("%s/projects/%s/services/%s" % (
+                    api, environment_id, service['id']
+                ))
+                r.raise_for_status()
+            except requests.exceptions.HTTPError:
+                tools.bail("Unable to request the service status from the Rancher API")
+            else:
+                service = r.json()
 
-            attempts = 0
-            while service['state'] != "active":
-                sleep(2)
-                attempts += 2
-                if attempts > upgrade_timeout:
-                    tools.bail("A timeout occured while waiting for Rancher to finish the previous upgrade")
-                try:
-                    r = requests.get("%s/projects/%s/services/%s" % (
-                        api, environment_id, service['id']
-                    ))
-                    r.raise_for_status()
-                except requests.exceptions.HTTPError:
-                    tools.bail("Unable to request the service status from the Rancher API")
-                else:
-                    service = r.json()
-
-            tools.msg("Upgrade finished")
+        tools.msg("Upgrade finished")
 
     sys.exit(0)
 
@@ -144,7 +146,6 @@ def upgrade(api, host, environment, stackOpt, serviceOpt, upgrade_timeout, batch
     
     # 3 -> Find the service in the stack
     service = _service.fetch(api, environment, stack, serviceOpt)
-    print(str(service))
     # 4 -> Is the service elligible for upgrade?
     if service['state'] == 'upgraded':
         tools.warn("The current service state is 'upgraded', marking the previous upgrade as finished before starting a new upgrade...")
@@ -161,3 +162,4 @@ def upgrade(api, host, environment, stackOpt, serviceOpt, upgrade_timeout, batch
     }}
 
     service = _service.upgrade(api, environment, service, upgrade)
+    return service, 'upgrade'

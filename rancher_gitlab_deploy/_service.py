@@ -26,9 +26,9 @@ def createService(api, environment, name, image):
         ), json=upgrade)
         r.raise_for_status()
     except requests.exceptions.HTTPError as e:
-        return None
+        return None, 'create'
     else:
-        return r.json()
+        return r.json(), 'create'
         
         
     
